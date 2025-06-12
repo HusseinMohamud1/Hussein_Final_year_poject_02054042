@@ -1,0 +1,330 @@
+% This script solves the energy trading optimization problem for all the
+% configurations specified in file 'configurations.txt' and stores the
+% Lambdas values for each scenario and microgrid. It also plots the evolution
+% % of Lambdas for each case.
+
+clear;
+close all;
+
+% %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Simulation parameters
+% %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+input_file="C:\Users\husse\OneDrive\Desktop\FYP\MATLAB\input_file.txt" ;
+topology = 'full';
+MaxIterations = 500; % maximum number of algorithm iterations
+MaxDualityGap = 0.2; % for the terminating condition
+MaxEpsilon = 1e-5; % for the terminating condition
+verbose = false; % if true, the script returns some more information
+IsDebug = false; % if true, the script returns a lot more information
+
+% Transfer cost of the form a + b*x + c*x^2
+CableCapacity = 0.06; % MW
+a = 0; b = 0; c = 3.68;
+
+% Read the rest of the parameters from the configuration file
+inputdata = readtable(input_file);
+
+[cases, M] = size(inputdata);
+M = M / 3;
+
+% Initialize matrices to store Lambdas for all scenarios and microgrids
+%print(cases)
+%print(M)
+%print(MaxIterations)
+Lambdas_all = zeros(cases, M, MaxIterations); % For all iterations
+Lambdas_final = zeros(cases, M); % For final values only
+
+uGcosts = zeros(M, cases);
+Sell4 = zeros(cases, 1);
+Price = zeros(cases, 1);
+
+% adjacency matrix
+switch topology
+    case 'full'
+        A = ones(M) - eye(M);
+    case 'line'
+        A = [zeros(M-1,1) eye(M-1); zeros(1,M)] + [zeros(1,M); eye(M-1) zeros(M-1,1)];
+    case 'ring'
+        A = [zeros(M-1,1) eye(M-1); zeros(1,M)] + [zeros(1,M); eye(M-1) zeros(M-1,1)];
+        A(M,1) = 1;
+        A(1,M) = 1;
+    case 'star'
+        A = [0 ones(1,M-1); ones(M-1,1) zeros(M-1)];
+    otherwise
+        error('Unknown topology.');
+end
+
+for icase = 1:cases
+    E_c = inputdata{icase,1:3:end}';
+    generators = inputdata{icase,2:3:end}';
+    Pmax = inputdata{icase,3:3:end}';
+
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    % Create cost functions
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    % Generation cost functions
+    C = cell(1,M);
+    C_prime = cell(1,M);
+    C_primeInv = cell(1,M);
+    for m=1:M
+        [C{m}, C_prime{m}, C_primeInv{m}] = create_cost_func(generators{m}, .98*Pmax(m));
+    end
+
+    % Transfer cost function
+    [gamma_cost, gamma_prime, gamma_primeInv] = create_cost_func(a, b, c, CableCapacity);
+
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    % Some debug stuff
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    if IsDebug || verbose
+        lambda_fig = figure;
+        title('Lambdas');
+        xlabel('iteration');
+
+        cost_fig = figure;
+        title('Local Costs');
+        xlabel('iterations');
+
+        gap_fig = figure;
+        title('Duality Gap');
+        xlabel('iterations');
+
+        ellipse = figure;
+        hold on;
+    end
+
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    % Find (loose) bounds for Lambdas
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    Lambdas_min = inf;
+    Lambdas_max = -inf;
+    for mm = 1:M
+        tmp = C_prime{mm}(0);
+        if Lambdas_min > tmp
+            Lambdas_min = tmp;
+        end
+        tmp = C_prime{mm}(1.01*max(Pmax(mm),E_c(mm)));
+        if Lambdas_max < tmp
+            Lambdas_max = tmp;
+        end
+    end
+
+    % Initialize Lambdas and containing ellipsoid
+    Lambdas = (Lambdas_min + Lambdas_max)/2*ones(M,1);
+    radius2 = (Lambdas_max - Lambdas_min)^2/2;
+    ElpsMatrix = eye(M) * radius2;
+
+    if IsDebug || verbose
+        updateplots(lambda_fig,1,Lambdas);
+        if M == 2
+            figure(ellipse)
+            line([Lambdas_min*[1 1] Lambdas_max*[1 1]], [Lambdas_min Lambdas_max*[1 1] Lambdas_min])
+            plotellipse(ElpsMatrix, Lambdas(1), Lambdas(2))
+            plot(Lambdas(1), Lambdas(2), 'xk')
+            set(gca,'DataAspectRatio',[1 1 1])
+        end
+    end
+
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    % Main algorithm
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    E_min = zeros(M);
+    E_sell = zeros(M,1);
+
+    counter = 1;
+    cost = zeros(M,1);
+    cost2 = zeros(M,1);
+    duality_gap = 10;
+    Cbest = -inf;
+    subg_nrmlz = inf;
+    while counter < MaxIterations && (subg_nrmlz > MaxEpsilon)
+        % Store Lambdas for the current iteration
+        Lambdas_all(icase, :, counter) = Lambdas';
+
+        % for given Lambdas, solve microgrid local problems
+        for ii=1:M
+            [E_sell(ii), E_min(:,ii)] = local_problem(E_c(ii), A(:,ii), Lambdas(ii), Lambdas, C_prime{ii}, C_primeInv{ii}, gamma_prime, gamma_primeInv);
+        end
+
+        % compute a subgradient of the dual cost function (see paper)
+        subgradient = sum(E_min,2) - E_sell;
+        % and normalize it with respect to the solution ellipsoid
+        subg_nrmlz = sqrt(subgradient'*ElpsMatrix*subgradient);
+        subgradient = subgradient / subg_nrmlz;
+
+        % compute total cost for given Lambdas
+        tmp = 0;
+        for mm = 1:M
+            tmp = tmp + C{mm}(E_c(mm) + E_sell(mm) - sum(E_min(:,mm))) + sum(gamma_cost(E_min(:,mm))) + sum(Lambdas.*E_min(:,mm)) - Lambdas(mm)*E_sell(mm);
+        end
+        if Cbest < tmp
+            Cbest = tmp;
+        end
+
+        % update Lambdas and containing ellipsoid
+        alpha_step = 0; %(Cbest - tmp)/subg_nrmlz;
+
+        jump = ElpsMatrix * subgradient;
+        Lambdas_old = Lambdas;
+        Lambdas = Lambdas + (1 + M*alpha_step)/(M+1) * jump;
+        ElpsMatrix_old = ElpsMatrix;
+        ElpsMatrix = M^2/(M^2-1)*(1-alpha_step^2)*(ElpsMatrix - 2*(1+M*alpha_step)/(M+1)/(1+alpha_step)*(jump*jump'));
+
+        % ensure the solution is acceptable
+        radi = eig(ElpsMatrix);
+        if any(radi<-.1)
+            alpha_step = 0;
+            Lambdas = Lambdas_old + (1 + M*alpha_step)/(M+1) * jump;
+            ElpsMatrix = M^2/(M^2-1)*(1-alpha_step^2)*(ElpsMatrix_old - 2*(1+M*alpha_step)/(M+1)/(1+alpha_step)*(jump*jump'));
+        end
+        radi = eig(ElpsMatrix);
+        if any(radi)<-.1
+            fprintf('cucu')
+        end
+
+        % check whether new Lambdas are within the original bounds
+        while any(Lambdas < Lambdas_min)
+            for mm = 1:M
+                if Lambdas(mm) < Lambdas_min
+                    subgradient = zeros(M,1);
+                    subgradient(mm) = -1;
+                    subg_nrmlz = sqrt(ElpsMatrix(mm,mm));
+                    subgradient = subgradient / subg_nrmlz;
+                    alpha_step = (-Lambdas(mm)+Lambdas_min)/subg_nrmlz;
+                    jump = ElpsMatrix * subgradient;
+
+                    Lambdas = Lambdas - (1 + M*alpha_step)/(M+1) * jump;
+                    ElpsMatrix = M^2/(M^2-1)*(1-alpha_step^2)*(ElpsMatrix - 2*(1+M*alpha_step)/(M+1)/(1+alpha_step)*(jump*jump'));
+                    subg_nrmlz = inf;
+                end
+            end
+        end
+
+        % this is not exactly the duality gap but it is helpful to declare
+        % convergence
+        duality_gap = sum(Lambdas.*(sum(E_min,2)-E_sell));
+
+        if (IsDebug && mod(counter,1)==0) || (verbose && mod(counter,50)==0)
+            fprintf('Iteration %d: volume = %e --- epsilon = %f --- duality gap = %f\n', counter, prod(radi), subg_nrmlz, duality_gap)
+            fprintf('\nLambdas =\n');
+            fprintf('        %-10.4f\n',Lambdas);
+
+            fprintf('E_min =\n');
+            fprintf(['        ' repmat('%-10g',1,M) '\n'],E_min');
+            updateplots(lambda_fig,counter,Lambdas);
+
+            fprintf('\nE_sell = \n');
+            fprintf('        %-10g \n',E_sell');
+
+            E_gen = E_c+sum(E_min,2)-sum(E_min,1)';
+            fprintf('\nE_gen =           E_c = \n');
+            fprintf('        %-12g       %-12g\n',[E_gen E_c]');
+
+            for m=1:M
+                cost(m) = C{m}(E_gen(m)) + sum(gamma_cost(E_min(:,m)));
+                cost2(m) = C{m}(E_c(m) + E_sell(m) - sum(E_min(:,m),1)) + sum(gamma_cost(E_min(:,m))) ...
+                    + sum(Lambdas.*E_min(:,m)) - Lambdas(m) * E_sell(m);
+            end
+
+            fprintf('\nTotal energy cost: %f (%f) USD per hour.\n\n', sum(cost), sum(cost2));
+            updateplots(cost_fig,counter,cost);
+            updateplots(gap_fig,counter,duality_gap);
+            if M==2
+                figure(ellipse)
+                plotellipse(ElpsMatrix,Lambdas(1),Lambdas(2))
+                plot(Lambdas(1), Lambdas(2),'xk')
+            end
+
+            fprintf([repmat('-',1,50) '\n']);
+            pause(1);
+        end
+
+        counter = counter + 1;
+    end
+
+    % Store final Lambdas for the current scenario
+    Lambdas_final(icase, :) = Lambdas';
+
+    % Plot Lambdas evolution for the current case
+   % figure;
+    plot(squeeze(Lambdas_all(icase, :, 1:counter-1))');
+    xlabel('Iteration');
+    ylabel('Lambdas');
+    title(['Lambdas Evolution for Case ', num2str(icase)]);
+    legend('uG1', 'uG2', 'uG3', 'uG4');
+    grid on;
+%    saveas(gcf, ['../results/lambdas_case_', num2str(icase), '.png']);
+
+    if IsDebug
+        updateplots(lambda_fig,counter,Lambdas);
+        updateplots(cost_fig,counter,cost);
+        updateplots(gap_fig,counter,duality_gap);
+    end
+
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    % Output
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    fprintf('\nSimulation ended after %d iterations.', counter);
+    fprintf('\nFinal duality gap: %f.\n\n', duality_gap);
+    fprintf('Lambdas =\n');
+    fprintf('        %-10.4f\n',Lambdas);
+
+    fprintf('E_min =\n');
+    fprintf(['        ' repmat('%-12g',1,M) '\n'],E_min');
+
+    fprintf('\nE_sell = \n');
+    fprintf('        %10g   (%10g)\n',[ sum(E_min,2)'; E_sell']);
+
+    E_gen = E_c+sum(E_min,2)-sum(E_min,1)';
+    fprintf('\nE_gen =             E_c = \n');
+    fprintf('        %-12g       %-12g\n',[E_gen E_c]');
+
+    gen_cost = zeros(M,1);
+    tx_cost = zeros(M,1);
+    for m=1:M
+        gen_cost(m) = C{m}(E_gen(m));
+        tx_cost(m) =  sum(gamma_cost(E_min(:,m)));
+        cost2(m) = C{m}(E_c(m) + E_sell(m) - sum(E_min(:,m),1)) + sum(gamma_cost(E_min(:,m))) ...
+            + sum(Lambdas.*E_min(:,m)) - Lambdas(m) * E_sell(m);
+    end
+    cost = gen_cost + tx_cost;
+    uGcosts(:,icase) = cost2;
+    fprintf('\nTotal energy cost per microgrid:')
+    fprintf('\n            Generation         Transmission       Total\n')
+    fprintf('            %-12g       %-12g       %-12g\n',[gen_cost tx_cost cost]')
+    fprintf('\nTotal energy cost: %f (%f) USD per hour.\n\n', sum(cost), sum(cost2));
+
+    Sell4(icase) = sum(E_min(M,:));
+    Price(icase) = Lambdas(M);
+end
+
+% Save Lambdas data to a file
+save('Lambdas_data.mat', 'Lambdas_all', 'Lambdas_final');
+
+figure
+plot(inputdata{:,end-2},uGcosts'/1000)
+xlabel('E_4^{(c)} [MWh]')
+ylabel('Cost [k$]')
+grid
+axis([0 12 0 1.4])
+hold
+plot(inputdata{:,end-2},C{1}(inputdata{:,1})/1000,'k--')
+plot(inputdata{:,end-2},C{1}(inputdata{:,end-2})/1000,'k-.')
+legend('uG1','uG2','uG3','uG4','disc. {1,2,3}','disc. 4','Location','northwest')
+title(['Topology: ' topology ' -- Local Costs'])
+%saveas(gcf, '../results/local_costs.png')
+
+figure
+hh = plotyy(inputdata{:,end-2},Sell4,inputdata{:,end-2},[Price Sell4.*Price]/1000);
+xlabel('E_4^{(c)} [MWh]')
+ylabel(hh(1),'[MWh]')
+ylabel(hh(2),'[k$]')
+grid
+axis(hh(1),[0 12 0 3.6])
+set(hh(1),'YTick',0:3)
+axis(hh(2),[0 12 0 1.8])
+set(hh(2),'YTick',0:.5:1.5)
+legend('Sold energy, left', 'Unit price, right', 'Income, right')
+title(['Topology: ' topology ' -- Trading'])
+%saveas(gcf, '../results/trading.png')
