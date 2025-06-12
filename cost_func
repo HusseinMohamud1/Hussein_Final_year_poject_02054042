@@ -1,0 +1,58 @@
+function [C, C_prime, C_primeInv] = create_cost_func(varargin)
+
+% CREATE_COST_FUNC Creates a generation cost function
+%    CREATE_COST_FUNC(gen_type, Pmax) returns the generation cost function
+%    for a generator of type "gen_type" (a string, see below), with maximum
+%    output power "Pmax". All original cost functions are quadratic (i.e., of the
+%    type a+b*x+c*x.^2). To have a "soft upperboud" at x=Pmax, the function
+%    is extended beyond Pmax with a high order power while ensuring
+%    continuity of the function and of its derivative. The function
+%    input is hence a demanded power (in MW) and the output is a cost
+%    (measured in $/h).
+%
+%    CREATE_COST_FUNC(a, b, c, Pmax) returns a cost function of which is
+%    the quadratic form a+b*x+c*x^2 between 0 and Pmax, and a
+%    high-order power of x beyond Pmax. The dimensions of a, b and c should
+%    be such that x is expressed in MW and the output in dollars per hour.
+%
+%    [C, C_prime, C_primeInv] = CREATE_COST_FUNC(...) also returns the cost
+%    function derivative and its inverse.
+%
+%    The possible generator types, with the coefficient values and
+%    suggested maximum output margins (in MW) are
+
+
+if nargin==2
+    gen_type = varargin{1};
+    Pmax = varargin{2};
+    switch gen_type
+        case 'U12'
+            a=86.3852; b=56.5640; c=.328412;
+        case 'US'
+            a=0.01; b=137; c=0.01;
+        case 'U20'
+            a=400.6849; b=130; c=0.5;
+
+        otherwise
+            error('Unknown generator type.');
+    end
+elseif nargin == 4
+    a = varargin{1};
+    b = varargin{2};
+    c = varargin{3};
+    Pmax = varargin{4};
+else
+    error('Wrong number of inputs!')
+end
+
+N = 30; % exponent of the function piece beyond Pmax
+B = N*Pmax^(N-1)/(b + 2*c*Pmax);
+A = a + b*Pmax + c*Pmax^2 - Pmax^N/B;
+
+C = @(x) (x<=Pmax).*(a+b*x+c*x.^2) + (x>Pmax).*(A+x.^N/B);
+
+C_prime = @(x) (x<=Pmax).*(b + 2*c*x) + (x>Pmax).*(x.^(N-1)*N/B);
+
+cmax = b + 2*c*Pmax;
+C_primeInv = @(x) (x<=cmax).*((x-b)/2/c) + (x>cmax).*(nthroot(B/N*x,N-1));
+end
