@@ -1,0 +1,269 @@
+% Main script code
+bn = 5;
+
+% Generate load profiles
+[total_load_res, appliance_loads_res, hours_res] = createLoadProfile('rural residential');
+%[total_load_agri, appliance_loads_agri, hours_agri] = createLoadProfile('agricultural');
+%[total_load_ind, appliance_loads_ind, hours_ind] = createLoadProfile('industrial');
+
+% Example parameters
+population = 2500; % Example population
+initial_soc = 0.5; % Initial state of charge (50%)
+charge_rate = 100; % Maximum charge rate in kW
+discharge_rate = 100; % Maximum discharge rate in kW
+efficiency = 0.9; % Round-trip efficiency (90%)
+dod = 0.5; % Depth of discharge (80%)
+
+% Example irradiance data (24 hours)
+irradiance = [0,0,0,0,0.052,0.165,0.315,0.446,0.547,0.596,0.577,0.515,0.405,0.252,0.133,0.038,0,0,0,0,0,0,0,0];
+
+% Example generation data (24 hours)
+generation = [0, 0, 0, 0, 8.5, 34.104, 67.269, 94.759, 114.353, 123.569, ...
+              119.703, 107.519, 85.263, 53.1, 26.335, 5.488, 0, 0, 0, 0, ...
+              0, 0, 0, 0];
+% Calculate peak demand and scaled load
+[peak_demand, scaled_load] = calculatePeakAndScaledLoad(total_load_res, population);
+
+% Calculate solar installation size
+solar_size = calculateSolarInstallationPeak(scaled_load, max(irradiance), 0.75);
+battery_capacity = solar_size/2; % Battery capacity in kWh
+
+% Model battery storage
+[soc, battery_charge, battery_discharge, net_battery] = modelStorage(scaled_load, generation, battery_capacity, initial_soc, charge_rate, discharge_rate, efficiency, dod);
+
+Peak_power_in_kw = peak_demand*population;
+Total_microgrid_load = scaled_load + net_battery;
+Total_microgrid_load=Total_microgrid_load./1000;
+
+% Save data to Excel
+a = saveRepeatedVectorToExcel(scaled_load, "microgrid_load.xlsx");
+c = a';
+
+%% All function definitions
+function [total_load, appliance_loads, hours] = createLoadProfile(scenario, daily_per_person_kWh, peak_hour)
+    if nargin < 2, daily_per_person_kWh = 0.41095; end
+    if nargin < 3, peak_hour = 18; end
+    hours = 0:23;
+    
+    switch lower(scenario)
+        case 'rural residential'
+            scenario_mult = 1.0;
+        case 'agricultural'
+            scenario_mult = 1.2;
+        case 'industrial'
+            scenario_mult = 1.3;
+        otherwise
+            error('Unknown scenario. Use: rural residential, agricultural, or industrial');
+    end
+    
+    total_daily_kWh = daily_per_person_kWh * scenario_mult;
+    appliances = getScenarioParameters(scenario);
+    [total_load, appliance_loads] = generateBaseLoads(appliances, hours);
+    
+    current_energy = trapz(hours, total_load);
+    scaling_factor = total_daily_kWh / current_energy;
+    total_load = total_load * scaling_factor;
+    appliance_loads = appliance_loads * scaling_factor;
+    
+    visualizeProfiles(hours, total_load, appliance_loads, appliances, total_daily_kWh);
+    fprintf('Verified daily consumption for %s: %.5f kWh\n', scenario, trapz(hours,total_load));
+end
+
+function appliances = getScenarioParameters(scenario)
+    switch lower(scenario)
+        case 'rural residential'
+            appliances = {
+                'LED Lighting',        0.015,  @(t) eveningPeakLighting(t);
+                'Phone Charging',      0.004,  @(t) dayPulse(t, 6, 14);
+                'Radio',               0.003,  @(t) eveningPeak(t, 18, 20);
+                'Small Fan',           0.012,  @(t) eveningPeak(t, 18, 21);
+                'Cookstove',           0.3,    @(t) eveningCooking(t);
+                'Clinic Equipment',    0.05,   @hospitalProfile};
+        case 'agricultural'
+            appliances = {
+                'Lighting',            0.025,  @(t) agriculturalLighting(t);
+                'Water Pump',          0.15,   @(t) bimodalUse(t,6,8,17,19);
+                'Irrigation System',   0.2,    @(t) solarNoise(t, 12);
+                'Grain Dryer',         0.3,    @(t) morningEveningUse(t,8,10,16,18);
+                'Refrigeration',       0.12,   @constantLoad;
+                'Tractor Charging',    0.1,    @(t) dayPulse(t, 9, 17)};
+        case 'industrial'
+            appliances = {
+                'Factory Lighting',    0.06,   @(t) dayPulse(t, 6, 20);
+                'Machinery',           0.7,    @(t) solarNoise(t, 12);
+                'Welding',             0.5,    @(t) bimodalUse(t,8,10,14,17);
+                'Cooling',             0.3,    @constantLoad;
+                'Conveyors',           0.2,    @(t) dayPulse(t, 7, 18);
+                'Air Compressor',      0.15,   @(t) solarNoise(t, 10)};
+        otherwise
+            error('Unknown scenario');
+    end
+end
+
+function y = eveningPeakLighting(t)
+    y = 0.9 * exp(-(t - 19).^2 / (2 * 2^2));
+end
+
+function y = dayPulse(t, start, stop)
+    y = 1./(1 + exp(-(t-start))) - 1./(1 + exp(-(t-stop)));
+end
+
+function y = eveningPeak(t, start, stop)
+    y = double(t >= start & t <= stop);
+end
+
+function y = eveningCooking(t)
+    y = 0.9 * exp(-(t - 19).^2 / (2 * 1.5^2));
+end
+
+function y = hospitalProfile(t)
+    y = 0.6 + 0.4*sin(2*pi*t/24 + pi/2);
+end
+
+function y = agriculturalLighting(t)
+    y = 0.4 + 0.6*exp(-(t-19).^2/(2*3^2));
+end
+
+function y = bimodalUse(t, mStart, mEnd, eStart, eEnd)
+    y = dayPulse(t, mStart, mEnd)*0.6 + dayPulse(t, eStart, eEnd);
+end
+
+function y = solarNoise(t, peak)
+    base = exp(-(t-peak).^2/(2*3^2));
+    y = base + 0.1*rand(size(t));
+    y = y/max(y);
+end
+
+function y = morningEveningUse(t, mStart, mEnd, eStart, eEnd)
+    morning_peak = 0.6 * double(t >= mStart & t <= mEnd);
+    evening_peak = double(t >= eStart & t <= eEnd);
+    y = morning_peak + evening_peak;
+end
+
+function y = constantLoad(t)
+    y = ones(size(t));
+end
+
+function [total_load, appliance_loads] = generateBaseLoads(appliances, hours)
+    appliance_loads = zeros(length(appliances), length(hours));
+    for i = 1:size(appliances,1)
+        power = appliances{i,2};
+        profile = appliances{i,3}(hours);
+        appliance_loads(i,:) = power * (profile / max(profile));
+    end
+    total_load = sum(appliance_loads, 1);
+end
+
+function visualizeProfiles(hours, total, appliance_loads, appliances, energy)
+    figure('Color','w', 'Position', [100 100 900 700])
+    subplot(2,1,1)
+    plot(hours, appliance_loads', 'LineWidth',1.5)
+    title('Appliance Load Contributions')
+    xlabel('Hour of Day'), ylabel('Power (kW)')
+    xlim([0 23]), grid on
+    legend(appliances(:,1), 'Location','northwest')
+    
+    subplot(2,1,2)
+    area(hours, total, 'FaceAlpha',0.4, 'EdgeColor','b')
+    title(sprintf('Total Daily Load Profile (%.3f kWh)', energy))
+    xlabel('Hour of Day'), ylabel('Power (kW)')
+    xlim([0 23]), grid on
+end
+
+function [peak_demand, scaled_load] = calculatePeakAndScaledLoad(total_load_agriculture, population)
+    peak_demand = max(total_load_agriculture);
+    aggregation = 1.1;
+    scaled_load = total_load_agriculture * population * aggregation;
+    
+    hours = 0:23;
+    figure('Color', 'w', 'Position', [100 100 800 400]);
+    plot(hours, scaled_load, '-o', 'LineWidth', 1.5, 'Color', [0, 0.5, 0]);
+    xlabel('Hour of Day');
+    ylabel('Power (kW)');
+    title(sprintf('Scaled Agricultural Load Profile (Population = %d)', population));
+    grid on;
+    xlim([0 23]);
+    ylim([0 max(scaled_load) * 1.1]);
+end
+
+function solar_installation_size = calculateSolarInstallationPeak(power_demand, peak_irradiance, efficiency_factor)
+    % Ensure power_demand is a scalar by taking the peak demand
+    if isvector(power_demand)
+        power_demand = max(power_demand); % Take the maximum hourly demand
+    end
+    
+    % Ensure inputs are scalars
+    peak_irradiance = max(peak_irradiance(:)); % Take maximum irradiance if it's a vector
+    efficiency_factor = efficiency_factor(1); % Take first element if it's a vector
+    
+    % Calculate installation size
+    solar_installation_size = power_demand / (peak_irradiance * efficiency_factor);
+    
+    % Force scalar output
+    solar_installation_size = solar_installation_size(1);
+end
+
+function [soc, battery_charge, battery_discharge, net_battery] = modelStorage(load_profile, solar_generation, battery_capacity, initial_soc, charge_rate, discharge_rate, efficiency, dod)
+    % Ensure all inputs are correct size and type
+    if ~isvector(load_profile) || length(load_profile) ~= 24
+        error('load_profile must be a 24-element vector');
+    end
+    if ~isvector(solar_generation) || length(solar_generation) ~= 24
+        error('solar_generation must be a 24-element vector');
+    end
+    if ~isscalar(battery_capacity) || battery_capacity <= 0
+        error('battery_capacity must be a positive scalar');
+    end
+    
+    hours = 24;
+    soc = zeros(1, hours+1); % Include initial state
+    battery_charge = zeros(1, hours);
+    battery_discharge = zeros(1, hours);
+    net_battery = zeros(1, hours);
+    soc(1) = initial_soc;
+    min_soc = 1 - dod;
+    max_soc = 1;
+
+    for t = 1:hours
+        % Calculate net energy at this hour
+        net_energy = solar_generation(t) - load_profile(t);
+        
+        if net_energy > 0
+            % Charging case
+            max_charge_by_rate = charge_rate;
+            max_charge_by_soc = (max_soc - soc(t)) * battery_capacity / efficiency;
+            charge_energy = min([net_energy, max_charge_by_rate, max_charge_by_soc]);
+            
+            battery_charge(t) = charge_energy;
+            battery_discharge(t) = 0;
+            soc(t+1) = soc(t) + (charge_energy * efficiency) / battery_capacity;
+        else
+            % Discharging case
+            max_discharge_by_rate = discharge_rate;
+            max_discharge_by_soc = (soc(t) - min_soc) * battery_capacity;
+            discharge_energy = min([-net_energy, max_discharge_by_rate, max_discharge_by_soc]);
+            
+            battery_discharge(t) = discharge_energy;
+            battery_charge(t) = 0;
+            soc(t+1) = soc(t) - discharge_energy / battery_capacity;
+        end
+        
+        net_battery(t) = battery_charge(t) - battery_discharge(t);
+        
+        % Debug output (uncomment if needed)
+        % fprintf('Hour %d: SOC=%.2f, Charge=%.2f, Discharge=%.2f\n',...
+        %         t, soc(t+1), battery_charge(t), battery_discharge(t));
+    end
+    
+    % Return only the SOC values for each hour (excluding initial state)
+    soc = soc(2:end);
+end
+
+function repeatedVector = saveRepeatedVectorToExcel(originalVector, filename)
+    if numel(originalVector) ~= 24
+        error('Input vector must have exactly 24 elements.');
+    end
+    repeatedVector = repmat(originalVector, 1, 365);
+    writematrix(repeatedVector', filename);
+    disp(['The repeated vector has been saved to ' filename]);
+end
